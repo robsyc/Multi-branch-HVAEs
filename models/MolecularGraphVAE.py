@@ -81,27 +81,30 @@ class MolGraphVAEncoder(torch.nn.Module):
         - GraphDTA (GATConv, dimensions, ...) https://github.com/thinng/GraphDTA/blob/master/models/gat.py
         - NGG (encoder, decoder, ... TODO their use of GIN could be interesting) https://github.com/iakovosevdaimon/Neural-Graph-Generator/blob/main/autoencoder.py
     """
-    def __init__(self, node_dim=64, edge_dim=16, hidden_channels=64, latent_dim=64, heads=8, dropout=0.2, subgraphs=[25, 12, 6]):
+    def __init__(self, node_dim=64, edge_dim=16, hidden_channels=128, latent_dim=64, dropout=0.2, subgraphs=[25, 12, 6]):
         super(MolGraphVAEncoder, self).__init__()
+        self.hidden_channels = hidden_channels
         self.subgraphs = subgraphs
         self.dropout = dropout
-        self.hidden_dim = hidden_channels * heads
 
         self.atom_encoder = AtomEncoder(emb_dim=node_dim)
         self.bond_encoder = BondEncoder(emb_dim=edge_dim)
 
-        self.conv = GATv2Conv(node_dim, hidden_channels, heads=heads, edge_dim=edge_dim)
-        self.bn = BatchNorm1d(self.hidden_dim)
+        self.gat1 = GATv2Conv(node_dim, hidden_channels, heads=8, edge_dim=edge_dim)
+        self.bn1 = BatchNorm1d(hidden_channels * 8)
+        self.gat2 = GATv2Conv(hidden_channels * 8, hidden_channels, heads=1, edge_dim=edge_dim)
+        self.bn2 = BatchNorm1d(hidden_channels)
+
         self.conv_layers = ModuleList()
         self.bn_layers = ModuleList()
         self.pool_layers = ModuleList()
-        for subgraph_size in subgraphs:
-            self.conv_layers.append(GATv2Conv(self.hidden_dim, hidden_channels, heads=heads, edge_dim=edge_dim))
-            self.bn_layers.append(BatchNorm1d(self.hidden_dim))
-            self.pool_layers.append(SAGPooling(self.hidden_dim, ratio=subgraph_size, GNN=GATv2Conv)) # https://github.com/pyg-team/pytorch_geometric/blob/master/torch_geometric/nn/pool/sag_pool.py
+        for i, subgraph_size in enumerate(subgraphs):
+            self.conv_layers.append(GATv2Conv(hidden_channels, hidden_channels, edge_dim=edge_dim))  
+            self.bn_layers.append(BatchNorm1d(hidden_channels))
+            self.pool_layers.append(SAGPooling(hidden_channels, ratio=subgraph_size)) # https://github.com/pyg-team/pytorch_geometric/blob/master/torch_geometric/nn/pool/sag_pool.py
 
-        self.fc_mean = Linear(self.hidden_dim, latent_dim)
-        self.fc_logvar = Linear(self.hidden_dim, latent_dim)
+        self.fc_mean = Linear(hidden_channels, latent_dim)
+        self.fc_logvar = Linear(hidden_channels, latent_dim)
     
     def forward(self, data, debug=False):
         adj_matrices = []
@@ -109,9 +112,9 @@ class MolGraphVAEncoder(torch.nn.Module):
 
         # Initialize out based on batch size
         try:
-            out = torch.zeros((data.num_graphs, self.hidden_dim), device=x.device)
+            out = torch.zeros((data.num_graphs, self.hidden_channels), device=x.device)
         except AttributeError:
-            out = torch.zeros((1, self.hidden_dim), device=x.device)
+            out = torch.zeros((1, self.hidden_channels), device=x.device)
 
         # Atom and bond encoding
         x = self.atom_encoder(x)
@@ -122,11 +125,17 @@ class MolGraphVAEncoder(torch.nn.Module):
             print("Output: ", out.shape)
 
         # Base convolution and pooling
-        x = self.conv(x, edge_index, edge_attr)
-        x = self.bn(x)
-        out += gmp(x, batch)
+        x = self.gat1(x, edge_index, edge_attr)
+        x = self.bn1(x)
+        x = F.dropout(x, self.dropout, training=self.training)
         if debug:
             print("First convolution: ", x.shape, edge_index.shape, edge_attr.shape)
+        x = self.gat2(x, edge_index, edge_attr)
+        x = self.bn2(x)
+        x = F.dropout(x, self.dropout, training=self.training)
+        out = out + gmp(x, batch)
+        if debug:
+            print("Second convolution: ", x.shape, edge_index.shape, edge_attr.shape)
 
         # Iterative hierarchical convolution and pooling
         for i, subgraph_size in enumerate(self.subgraphs):
@@ -138,7 +147,7 @@ class MolGraphVAEncoder(torch.nn.Module):
 
             subgraph = self.pool_layers[i](x, edge_index, edge_attr, batch)
             x, edge_index, edge_attr, batch, perm, score = subgraph
-            out += gmp(x, batch)
+            out = out + gmp(x, batch)
             # perm: indices of nodes in the original graph that are kept
             # score: attention scores of each kept node
 
@@ -156,6 +165,14 @@ class MolGraphVAEncoder(torch.nn.Module):
         logvar = self.fc_logvar(out)
         return mean, logvar, adj_matrices
 
+
+def vector2adj(x, n_nodes):
+    adj = torch.zeros(x.size(0), n_nodes, n_nodes, device=x.device) # empty adjacency matrix
+    idx = torch.triu_indices(n_nodes, n_nodes, 1)                   # indices for upper triangular part
+    adj[:, idx[0], idx[1]] = x                                      # fill upper triangular part with sampled values
+    adj = adj + torch.transpose(adj, 1, 2)                          # make adjacency matrix symmetric
+    return adj
+
 class MolGraphVADecoder(torch.nn.Module):
     """
     Variational Molecular Graph Auto-Encoder Decoder-block
@@ -170,40 +187,64 @@ class MolGraphVADecoder(torch.nn.Module):
     Also see implementations by:
         - NGG (encoder, decoder, ...) https://github.com/iakovosevdaimon/Neural-Graph-Generator/blob/7073338a8a41c18d5963c275157bafa3cc9f735f/autoencoder.py#L10
     """
-    def __init__(self, latent_dim=64, hidden_channels=64, subgraphs=[6, 12, 25], n_nodes=50):
+    def __init__(self, latent_dim=64, hidden_channels=128, subgraphs=[6, 12, 25], n_nodes=50):
         super(MolGraphVADecoder, self).__init__()
         self.n_nodes = n_nodes
         self.subgraphs = subgraphs
 
         self.relu = LeakyReLU()
-        self.fc_layers = ModuleList()
+        self.fc = Linear(latent_dim, hidden_channels)
+        self.bn = BatchNorm1d(hidden_channels)
+
         self.unpool_layers = ModuleList()
-        for i in range (n_layers):
-            if i == 0:
-                self.fc_layers.append(Linear(latent_dim, hidden_channels))
-            else:
-                self.fc_layers.append(Linear(hidden_channels, hidden_channels))
-            
-
-        self.fc1 = Linear(latent_dim, hidden_channels)
-        self.fc2 = Linear(hidden_channels, hidden_channels)
-        self.fc3 = Linear(hidden_channels, 2 * n_nodes * (n_nodes - 1) // 2) # adj matrix minus diagonal
-        self.relu = LeakyReLU()
+        self.residual_layers = ModuleList()
+        self.bn_layers = ModuleList()
+        for i, subgraph_size in enumerate(subgraphs):
+            self.unpool_layers.append(Linear(hidden_channels, 2 * subgraph_size * (subgraph_size - 1) // 2)) # adj matrix minus diagonal
+            self.residual_layers.append(Linear(hidden_channels + (2 * subgraph_size * (subgraph_size - 1) // 4), hidden_channels))
+            self.bn_layers.append(BatchNorm1d(hidden_channels))
     
-    def forward(self, x):
-        x = self.relu(self.fc1(x))
-        x = self.relu(self.fc2(x))
-        x = self.fc3(x)
-        x = torch.reshape(x, (x.size(0), -1, 2)) # reshape to two halves of symmetric adjacency matrix
-        x = torch.nn.functional.gumbel_softmax(
-            x, tau=1, hard=True)[:,:,0] # sample from categorical distribution, mashing both halves
-        adj = torch.zeros(x.size(0), self.n_nodes, self.n_nodes, device=x.device) # empty adjacency matrix
-        idx = torch.triu_indices(self.n_nodes, self.n_nodes, 1) # indices for upper triangular part
-        adj[:, idx[0], idx[1]] = x # fill upper triangular part with sampled values
-        adj = adj + torch.transpose(adj, 1, 2) # make adjacency matrix symmetric
+        self.unpool = Linear(hidden_channels, 2 * n_nodes * (n_nodes - 1) // 2)
+        # TODO we're only reconstructing 1 node/edge feature because otherwise it gets very complex with softmax and reshaping
+        self.node_features_decoder = Linear(hidden_channels + (2 * n_nodes * (n_nodes - 1) // 4), n_nodes * len(x_map["atomic_num"]))
+        self.edge_features_decoder = Linear(hidden_channels + (2 * n_nodes * (n_nodes - 1) // 4), (2 * n_nodes * (n_nodes - 1) // 2) * len(e_map["bond_type"]))
 
-        # TODO edge and node features?!
-        return adj
+    def forward(self, x):
+        adj_matrices = []
+        x = self.bn(self.relu(self.fc(x)))
+        for i, subgraph_size in enumerate(self.subgraphs):
+            # Generate subgraph adjacency matrix
+            h_adj = self.unpool_layers[i](x)
+            h_adj = torch.reshape(h_adj, (h_adj.size(0), -1, 2))                        # reshape to two halves of symmetric adjacency matrix
+            h_adj = torch.nn.functional.gumbel_softmax(x, tau=1, hard=True)[:,:,0]      # sample from categorical distribution, mashing both halves
+            adj = vector2adj(h_adj, subgraph_size)                                      # convert to adjacency matrix
+            adj_matrices.append(adj)
+
+            # Incorporate subgraph adjacency matrix into the next layer
+            h = self.residual_layers[i](torch.cat([x, h_adj], dim=1))
+            h = self.bn_layers[i](self.relu(h))
+            x = x + h
+
+        # Generate final adjacency matrix
+        h_adj = self.unpool(x)
+        h_adj = torch.reshape(h_adj, (h_adj.size(0), -1, 2))
+        h_adj = torch.nn.functional.gumbel_softmax(x, tau=1, hard=True)[:,:,0]
+        adj = vector2adj(h_adj, self.n_nodes)
+        adj_matrices.append(adj)
+
+        # Generate node and edge features
+        x = self.node_features_decoder(torch.cat([x, h_adj], dim=1))
+        node_features = self.node_features_decoder(x)
+        node_features = torch.reshape(node_features, (node_features.size(0), self.n_nodes, -1))
+        node_features = torch.nn.functional.softmax(node_features, dim=2)
+        edge_features = self.edge_features_decoder(x)
+
+
+
+
+
+
+        return adj_matrices
     
 class MolGraphVAE(torch.nn.Module):
     """
@@ -241,9 +282,9 @@ class MolGraphVAE(torch.nn.Module):
 
     def encode(self, data):
         # TODO MoVAE suggests encoding nodes & edges separately...
-        mean, logvar = self.encoder(data)
+        mean, logvar, adj_matrices = self.encoder(data)
         z = self.reparameterize(mean, logvar)
-        return mean, logvar
+        return mean, logvar, adj_matrices
     
     def decode(self, z):
         adj = self.decoder(z)
