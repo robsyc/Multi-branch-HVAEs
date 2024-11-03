@@ -1,0 +1,6 @@
+torch
+torchvision
+torchaudio
+torch_geometric
+PyTDC
+rdkit
